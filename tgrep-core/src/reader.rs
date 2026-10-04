@@ -23,6 +23,72 @@ pub struct IndexReader {
 
 impl IndexReader {
     pub fn open(index_dir: &Path) -> Result<Self> {
+        Self::open_impl(index_dir, false)
+    }
+
+    /// Open every section needed to identify an immutable snapshot. Ordinary
+    /// readers retain their legacy empty-section handling.
+    pub(crate) fn open_for_snapshot(index_dir: &Path) -> Result<Self> {
+        let reader = Self::open_impl(index_dir, true)?;
+        reader
+            .validate_lookup()
+            .map_err(crate::Error::IndexCorrupted)?;
+        reader
+            .validate_snapshot_postings()
+            .map_err(crate::Error::IndexCorrupted)?;
+        Ok(reader)
+    }
+
+    fn validate_snapshot_postings(&self) -> std::result::Result<(), String> {
+        let mut expected_offset = 0_u64;
+        for i in 0..self.num_entries {
+            let entry = self.read_lookup_entry(i);
+            if entry.trigram > 0x00ff_ffff {
+                return Err(format!(
+                    "shared base lookup entry {i} has an invalid trigram"
+                ));
+            }
+            if entry.offset != expected_offset {
+                return Err(format!(
+                    "shared base lookup entry {i} has posting offset {}, expected {expected_offset}",
+                    entry.offset
+                ));
+            }
+            let (_, bytes) = self.nth_trigram_raw(i).ok_or_else(|| {
+                format!("shared base lookup entry {i} has an invalid posting range")
+            })?;
+            let mut previous_file_id = None;
+            for raw in bytes.as_chunks::<POSTING_ENTRY_SIZE>().0 {
+                let posting = PostingEntry::decode(raw);
+                if self.file_path(posting.file_id).is_none() {
+                    return Err(format!(
+                        "shared base lookup entry {i} references out-of-range file_id {}",
+                        posting.file_id
+                    ));
+                }
+                if previous_file_id.is_some_and(|previous| posting.file_id <= previous) {
+                    return Err(format!(
+                        "shared base lookup entry {i} has non-increasing posting file IDs"
+                    ));
+                }
+                if posting.loc_mask == 0 {
+                    return Err(format!(
+                        "shared base lookup entry {i} has a zero location mask for file_id {}",
+                        posting.file_id
+                    ));
+                }
+                previous_file_id = Some(posting.file_id);
+            }
+            expected_offset += bytes.len() as u64;
+        }
+        let postings_len = self.postings.as_ref().map_or(0, |postings| postings.len()) as u64;
+        if expected_offset != postings_len {
+            return Err("shared base index.bin contains unreferenced posting bytes".to_string());
+        }
+        Ok(())
+    }
+
+    fn open_impl(index_dir: &Path, require_complete_sections: bool) -> Result<Self> {
         let lookup_path = index_dir.join("lookup.bin");
         let postings_path = index_dir.join("index.bin");
         let files_path = index_dir.join("files.bin");
@@ -54,6 +120,12 @@ impl IndexReader {
 
         let lookup_len_u64 = lookup_file.seek(SeekFrom::End(0))?;
         let postings_len_u64 = postings_file.seek(SeekFrom::End(0))?;
+
+        if require_complete_sections && ((lookup_len_u64 == 0) != (postings_len_u64 == 0)) {
+            return Err(crate::Error::IndexCorrupted(
+                "shared base has mismatched empty lookup.bin and index.bin sections".to_string(),
+            ));
+        }
 
         let (lookup, postings, num_entries) = if lookup_len_u64 == 0 || postings_len_u64 == 0 {
             (None, None, 0)
@@ -229,6 +301,22 @@ impl IndexReader {
 
     pub fn file_table_id(&self) -> crate::meta::FileTableId {
         self.file_table_id
+    }
+
+    /// Identity of the path table, lookup table and postings, independent of
+    /// their storage directory. Computed once when opening a shared base.
+    pub(crate) fn snapshot_id(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"tgrep/shared-base/v1\0");
+        hasher.update(&self.file_table_id);
+        for bytes in [
+            self.lookup.as_deref().unwrap_or_default(),
+            self.postings.as_deref().unwrap_or_default(),
+        ] {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        *hasher.finalize().as_bytes()
     }
 
     /// Total number of unique trigrams.
