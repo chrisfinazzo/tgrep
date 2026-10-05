@@ -4,7 +4,9 @@
 foundation implemented in [PR #168](https://github.com/microsoft/tgrep/pull/168),
 with [committed-tree base generations](tgrep-core/src/generations/mod.rs) and
 [core worktree synchronization](tgrep-core/src/worktrees.rs) implemented.
-Automatic multi-worktree CLI/server support is not implemented yet.
+The opt-in [repository daemon](tgrep-cli/src/serve/shared/mod.rs) now provides
+leases, native/poll synchronization and automatic query discovery after explicit
+attachment. Legacy single-root CLI/server behavior remains the default.
 
 ## Goal and ownership
 
@@ -143,15 +145,15 @@ The same membership/visibility rules must apply to content searches and
 
 ## Registration, readiness, and freshness
 
-The proposed versioned daemon API has these logical operations; names and wire
-schemas are not yet a public protocol:
+The versioned daemon API implements these operations; the concrete wire contract
+is below:
 
 | Operation | Purpose |
 | --- | --- |
-| `attach(root, expected_head)` | Validate the worktree, select/pin a base, establish its view, and return a registration identity/readiness state |
-| `search(worktree_id, ...)` / `files(worktree_id, ...)` | Route requests to the correct worktree view |
-| `refresh(worktree_id, changed_paths)` | Promptly process known-change hints |
-| `detach(worktree_id)` | Release the caller's registration; reclaim idle state when unused |
+| `attach(root, revision, profile, lease)` | Select/pin a base, capture changes and return a view identity, lease and readiness |
+| `search(root, view, query)` / `files(root, view, query)` | Route requests to the private ready view |
+| `refresh(root, view, lease, changed, full)` | Invalidate immediately; return the processed epoch after reconciliation |
+| `detach(root, view, lease)` | Release one lease; retire the view only after the final lease |
 
 Normal CLI invocations should discover the same view automatically. Releasing
 one session must not stop a daemon or worktree view still used by other clients.
@@ -282,6 +284,7 @@ the supplied parent, including an existing worktree or snapshot at that child.
 
 | API | Contract |
 | --- | --- |
+| `Repository::resolve_commit_tree(revision)` | Resolve exact commit/tree IDs without building or publishing; symbolic revisions use the discovered worktree |
 | `ensure(revision, profile, predecessor)` | Resolve an exact commit/tree, build or reuse the key; incompatible supplied predecessors error |
 | `EnsureResult` | Pinned `Arc<Generation>`, requested commit, and per-request `BuildStats` |
 | `open(key)` / `list()` | Open exact or list validated published generations; errors never become empty bases |
@@ -480,11 +483,181 @@ recoverable error, not an empty overlay. Bases remain immutable and retain-all.
 
 This core layer does **not** own native watchers, automatic shared CLI serving,
 daemon routing/wire schemas or content caches. Existing CLI/server behavior is
-unchanged; opt-in integration is the next layer.
+unchanged unless a worktree is explicitly attached to the daemon described below.
+
+## Daemon wire contract v1
+
+Run `tgrep serve --shared ROOT --shared-storage EXISTING_EXTERNAL_DIRECTORY`.
+The runtime supervises this foreground process. `shared attach ROOT --revision
+REV --lease TOKEN`, `shared refresh ROOT --lease TOKEN [--changed REL ... | --full]`, and
+`shared detach ROOT --lease TOKEN` are CLI wrappers emitting one JSON result.
+The new literal subcommand name must be escaped as a pattern: `tgrep -- shared .`.
+
+The common Git directory holds `tgrep-daemon-v1.json` (protocol, random-like unique
+instance ID, repository identity, PID, loopback port, canonical storage path).
+An OS lock in the same directory excludes a second daemon even with a different
+storage choice. The listener/worker queues exist before registration publication.
+Every attached worktree has a separate `tgrep-view-v1.json` in its **actual
+worktree git_dir**, binding the daemon instance, canonical root, view ID and exact
+generation. No `serve.json` schema is overloaded. Attach publishes this marker;
+last detach removes it only if instance/view still match. Discovery stops at the
+nearest Git boundary and validates capabilities, root/base/profile and readiness
+before emitting any rows. Merely having a daemon is not attachment.
+Client discovery carries one validated root/repository through daemon discovery
+and lookup (three Git subprocesses total per attached CLI query). Daemon query
+workers launch no Git subprocesses: they reuse the attached repository, rechecking
+canonical root, nested boundaries, gitfile target and common-directory identity.
+Real Git trace2 process-start events assert these counts in integration tests.
+
+RPC is one newline-delimited JSON request/response per TCP connection, loopback
+only. All requests have this envelope (including `hello`):
+
+```json
+{"jsonrpc":"2.0","protocol":1,"instance":"FROM_DAEMON_MARKER","repository":"FROM_DAEMON_MARKER","id":1,"method":"hello","params":{}}
+```
+
+Successful results repeat `protocol`, `instance` and `repository`. Errors have
+`error.code` and `error.message`, never success-shaped empty results. V1 rejects
+unknown envelope/parameter fields, malformed options and incompatible identities.
+Clients require the matching request ID on successful responses. A valid error
+object (integer code, string message, no result) may instead have an explicit
+null ID when rejected before request parsing, preserving connection-queue
+saturation diagnostics. Missing/mismatched IDs and malformed errors are rejected.
+Search RPCs must omit `passthru` or set it to `false`; `true` is rejected with a
+scan-required error because indexed candidates omit nonmatching files. The CLI
+keeps `--passthru` on its existing filesystem-scan path when it emits all lines.
+Canonical worktree roots must be UTF-8 for JSON transport. CLI and server reject
+unsupported roots, including Unicode aliases to them, before serialization or
+generation publication; the core API's native-path support is unchanged.
+Gitfile and `commondir` targets retain native path bytes on Unix, even when
+metadata lives outside a UTF-8 worktree. Discovery and identity revalidation
+share the same decoder without spawning Git on the daemon's hot query path.
+The existing `ignore` dependency is vendored at its locked version with the
+same native-path correction in Git ignore-source discovery; ignore precedence,
+nested repository boundaries and malformed-ignore failures are preserved.
+See [dependency provenance and distribution](vendor/ignore/PATCHES.md).
+Instance IDs prevent stale metadata/port reuse; they are not authentication
+against hostile local processes. Storage, repository metadata and the loopback
+user environment are trusted.
+
+| Method | `params` | Result-specific fields |
+| --- | --- | --- |
+| `hello` | `{}` | `capabilities`, `profile`, `retention`, `limits` |
+| `attach` | `root`, `revision`, `profile`, `lease` | `view`, `lease`, `root`, `generation`, `requested_commit`, `ready`, `attach_build` |
+| `lookup` | `root` | Current view descriptor and status; does not create a lease |
+| `status` | `root`, `view`, `query: {}` | Readiness, pending/full flags, epoch, last error/success, watcher mode, sharing/extraction counters |
+| `refresh` | `root`, `view`, `lease`, `changed: []`, `full: false` | Descriptor plus `processed_epoch`; no hints means full verification |
+| `detach` | `root`, `view`, `lease` | `remaining_leases`, `detached`, `view`, nullable `registration_warning` |
+| `files` | `root`, `view`, `query: {scope, hidden, max_depth}` | Root-relative `files`, `epoch`, `ready`, `generation`, `backend: "shared-v1"` |
+| `search` | `root`, `view`, `query` | Root-relative match/context rows, `file_stats`, `index_stats`, `epoch`, same view/base/backend fields |
+
+The `recoverable-attach` capability requires a caller-owned `lease` on every
+attach RPC: 1-128 ASCII letters, digits, hyphens or underscores. Persist a unique
+token before sending. Repeating a live token with the same canonical root,
+literal revision and profile replays the original attachment and `attach_build`
+statistics, without allocating another lease or re-resolving symbolic revisions.
+It works at the lease limit and after response loss. A token already used by
+another root/revision is an error. Distinct callers use distinct tokens.
+`lookup` followed by `detach` also releases a known token without its original
+response; the CLI does that lookup automatically. Tokens are scoped to the
+daemon instance, are not authentication credentials, and are forgotten on detach
+or restart. After restart, explicitly attach again with fresh tokens.
+Final detach always releases the view/lease even if registration cleanup fails;
+it reports the failure in `registration_warning` and daemon stderr. Missing
+markers are harmless. Corrupt or foreign markers are not removed without
+matching instance/view identity, so their continued presence selects safe fallback.
+CLI `--lease` is optional for interactive convenience: if omitted, a generated
+token is printed on stderr before transmission and must be captured and supplied
+on retry. Runtime integrations should always supply their own token.
+
+The `profile` is required on attach:
+
+```json
+{"content":"raw-git-blob-auto-v1","coverage":"tracked-regular-files-v1","max_blob_bytes":67108864}
+```
+
+`query` uses the existing search RPC fields built by `server_search_request`:
+pattern/extra_patterns, matcher flags, types/type_add/type_clear, globs,
+context/output-detail fields, hidden, scope and max_depth. Only default automatic
+decoding and the 64 MiB profile are compatible. `scope` is empty or an existing
+relative directory, never a regular file; it cannot escape the root or cross a nested repository. Content reads
+use no-follow root-contained handles, never another worktree's content cache.
+Candidate collection captures an epoch; a concurrent invalidation rejects the
+response before output. Read failures invalidate the view and return errors.
+
+Views are shared only for the same root and exact tree/profile. Independent lease
+tokens release independently, have no automatic expiry, and are invalid after
+restart. Reattachment resolves and compares the requested tree with the existing
+pin before any generation build/publication; a different commit with the same
+tree is compatible when using a new lease. New generations may reuse a compatible currently pinned predecessor;
+existing views never migrate. All generations/checkpoints are retained.
+Generation and overlay directories are separate under external storage. A saved
+delta is keyed by canonical root and exact generation and is full-revalidated on
+reattach. Unavailable/corrupt generations or checkpoints cannot reveal the base.
+
+Normal CLI search/files/status automatically use an existing attachment.
+`--shared` additionally forces shared-only discovery. Explicit `--index-path`
+preserves ordinary index intent unless combined with `--shared`. Stale/missing
+forced registrations, incompatible options, saturation and not-ready states
+produce meaningful scan diagnostics, bypassing all ordinary index shortcuts.
+Marker entry presence includes dangling symlinks, so corrupt metadata cannot
+silently select a stale ordinary index.
+`status` reports an error rather than misleading legacy status. `--no-index`
+always scans. Positive indexed globs filter the admitted corpus; scans can
+reinclude ignored files, as with ordinary indexes.
+
+Limits are aggregate and visible in `hello`: 32 views, 256 leases, 8192 native
+subscriptions and 16384 hint slots by default. `--shared-max-views`,
+`--shared-max-leases`, `--watch-budget`, `--watcher-queue-cap` select them.
+Watch/hint budgets are fixed per-view shares of the configured maximum; there
+is no borrowing. Bounded nonrecursive registration reuses the ordinary watcher
+registry on each platform; too many directories or registration errors select
+polling rather than partially claiming native coverage. There is one serialized
+index/reconcile worker and two separate query workers, so repairing A does not
+take a repository-global search lock or prevent ready B from searching. Work
+queue capacity is max_views; query queue is 16, incoming connection queue 32.
+Two routers enforce 1 MiB requests and timeouts. Responses over 64 MiB fail
+explicitly without truncation. An encoded-byte budget checks borrowed rows before
+allocating their JSON objects, counts filename/statistic/escaped-string overhead
+across files, and bounds final serialization. Existing per-file matching state
+and candidate/path tables remain proportional to the admitted input corpus;
+the response cap is not a total-process memory cap. There is no content cache.
+Mapped generations, path tables and private
+postings still scale with repository/overlay size, not with a fixed memory cap.
+Native directory registration and event filtering exclude the root's `.tgrep`
+storage directory, not eligible hidden directories such as `src/.tgrep`.
+
+Callbacks immediately invalidate the appropriate view; hints are bounded and
+overflow/unknown events request full repair. Registration precedes initial
+reconciliation. A failed or concurrently invalidated pass stays not ready and
+retries; no base-only window exists. Consecutive failures use completion-based
+exponential retry delays of 1, 2, 4, 8, 16 then 30 seconds; success or explicit
+refresh resets the delay. Explicit refresh does not wait for the retry deadline.
+Status exposes `reconcile_attempts`, `consecutive_failures`, `retry_delay_ms` and
+the retained `last_error`. Daemon readiness stays closed until both the core
+refresh and checkpoint publication finish, including failed checkpoint retries.
+Candidate files are opened through the view's retained snapshot reader. Every
+query ends with a root-verified epoch check, including empty and filename-only
+responses; replacing the directory cannot pair old candidates with a new root.
+Both auto and poll modes perform full
+verification every `--poll-interval` seconds after completion (default 120), also
+repairing missed bytes, ignores and external Git/global configuration changes.
+Native notifications allow earlier incremental repair. `--no-watch` disables
+both periodic and native refresh, not initial reconciliation or explicit runtime
+refresh. Neither ready nor a processed epoch promises the newest possible bytes.
+
+Integration tests measure three unchanged tracked files as 3 reads/decodes,
+0 private extractions, and the same `Arc<SharedBase>` in both views. A linked
+worktree's ordinary `.git` pointer file adds 1 read/decode and 1 private extraction
+on initial reconciliation (4 reads and 1 extraction total); it remains visible
+with `--hidden`, while real Git metadata directories stay excluded.
+Four CRLF-transformed paths require 4 private extractions plus the linked
+gitfile's 1 (5 total), with 0 new extractions on no-op verification.
+Sharing never promises to eliminate startup reads or checkout transformations.
 
 ## Implementation status and rollout
 
-The implemented increments are core-library APIs, not automatic shared indexing:
+The implemented increments are additive; shared serving requires explicit opt-in:
 
 | Surface | Current status |
 | --- | --- |
@@ -498,7 +671,7 @@ The implemented increments are core-library APIs, not automatic shared indexing:
 | [`Generation coverage`](tgrep-core/tests/generations.rs) | Temporary repositories/worktrees, thread/process races, content transformations, immutable old readers, errors and interrupted publication |
 | [`Worktree synchronization`](tgrep-core/src/worktrees.rs) | Pinned private views, actual-content verification, atomic readiness/membership, bounded invalidations, full repair and bound checkpoints |
 | [`Synchronization coverage`](tgrep-core/src/worktrees/tests.rs) | Real divergent worktrees, scan/candidate parity, CRLF/smudge/decoding, sparse/assume-unchanged, filtering, epochs, errors and extraction counts |
-| Shared CLI/daemon routing and native watchers | Follow-up work; not yet implemented |
+| Shared CLI/daemon routing and native watchers | Versioned leases, discovery, bounded workers/watchers/hints, full repair, delta checkpoints, strict scan fallback |
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
@@ -521,9 +694,9 @@ reviewable increments, each with its own correctness coverage:
 
 1. **Base generations (implemented):** Git tree/profile identity, immutable
    build/publication, incremental reuse, pins and conservative retain-all.
-2. **Worktree synchronization:** complete delta discovery, private membership,
+2. **Worktree synchronization (implemented):** complete delta discovery, private membership,
    watchers/reconciliation, checkpoint recovery, and readiness gating.
-3. **Daemon and integration:** worktree registration/routing, CLI discovery,
+3. **Daemon and integration (implemented, opt-in):** worktree registration/routing, CLI discovery,
    versioned agent runtime integration, resource budgets, and scan fallback.
 
 Before enabling automatic shared mode, verify isolated results against scans
