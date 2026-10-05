@@ -13,10 +13,12 @@ pub(crate) mod ondisk;
 pub mod path_index;
 pub mod query;
 pub mod reader;
+pub mod rooted;
 pub mod shared;
 pub mod trigram;
 pub mod visibility;
 pub mod walker;
+pub mod worktrees;
 
 pub use error::{Error, Result};
 pub use ondisk::PostingEntry;

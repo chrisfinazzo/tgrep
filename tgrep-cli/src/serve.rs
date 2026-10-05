@@ -469,6 +469,7 @@ struct ServerState {
     cache_generation: std::sync::atomic::AtomicU64,
     recent_reindexes: Mutex<RecentReindexCache>,
     root: PathBuf,
+    rooted: tgrep_core::rooted::RootedDir,
     watcher_active: std::sync::atomic::AtomicBool,
     /// True while the initial index build is in progress.
     indexing: std::sync::atomic::AtomicBool,
@@ -888,6 +889,7 @@ pub fn run(root: &Path, index_path: Option<&Path>, options: ServeOptions<'_>) ->
             RECENT_REINDEX_MAX_ENTRY_BYTES,
         )),
         root: root.clone(),
+        rooted: tgrep_core::rooted::RootedDir::open(&root)?,
         watcher_active: std::sync::atomic::AtomicBool::new(false),
         indexing: std::sync::atomic::AtomicBool::new(needs_build),
         flushing: std::sync::atomic::AtomicBool::new(false),
@@ -4083,7 +4085,7 @@ fn sweep_removed_files(
         // Transient failures preserve, as they do in `reindex_file`: a
         // descriptor limit or a sharing violation says nothing about whether
         // the path belongs in the index, and the next reconcile will ask again.
-        match open_within_root(&state.root, &state.root.join(rel)) {
+        match open_within_root(state, &state.root.join(rel)) {
             Ok(file) => match file.metadata() {
                 // Back, and reachable without leaving the tree.
                 Ok(meta) if meta.file_type().is_file() => continue,
@@ -4988,205 +4990,17 @@ fn proves_ineligible(error: &std::io::Error) -> bool {
     false
 }
 
-/// Open a file without following a final symlink, so the handle is the path
-/// itself rather than wherever it points.
-///
-/// Only the last component. For a path whose ancestors are not already trusted,
-/// use [`open_within_root`] — which on unix has no use for this, since `openat`
-/// resolves the final component the same way as every other one.
-#[cfg(not(unix))]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // Opens the reparse point rather than its target. Unlike O_NOFOLLOW
-        // this succeeds, so the caller's `is_file` check on the handle's
-        // metadata is what rejects it — a reparse point is not a regular file.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        std::fs::File::open(path)
-    }
-}
-
-/// Open a file under `root` without traversing a symlink at *any* level.
-///
-/// Refusing to follow the final component is not enough. A path arrives here
-/// from an event or a replay as a name, and `root/a/file` reads the same
-/// whether `a` is a directory or a link to one — so an intermediate link is
-/// enough to hand back a file outside the served tree, which is exactly the
-/// containment the walker's `follow_links(false)` promises and the index's
-/// contract depends on.
-///
-/// `root` itself is the trust anchor and is opened normally: it is the
-/// directory the user asked us to serve, so a link there is theirs to have.
-///
-/// On unix this is race-free. Each component is resolved with `openat` against
-/// the handle for its parent, so the name is never re-resolved and there is no
-/// window in which a directory can be swapped for a link between the check and
-/// the use.
-#[cfg(unix)]
-fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
+/// Reuse the server's pinned root for every read and verification pass.
+fn open_within_root(state: &ServerState, path: &Path) -> std::io::Result<std::fs::File> {
     use std::io::{Error, ErrorKind};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-
-    let components = relative_components(root, path)?;
-    let mut dir: OwnedFd = std::fs::File::open(root)?.into();
-    let last = components.len() - 1;
-    for (i, component) in components.iter().enumerate() {
-        let name = std::ffi::CString::new(component.as_bytes())
-            .map_err(|_| Error::new(ErrorKind::InvalidInput, "path component contains a NUL"))?;
-        // `O_DIRECTORY` on the intermediates so a *file* in the middle of the
-        // path fails here rather than at the next `openat`, and `O_NOFOLLOW` on
-        // every one of them, including the last. `O_NONBLOCK`: see
-        // `open_no_follow`.
-        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
-        if i != last {
-            flags |= libc::O_DIRECTORY;
-        }
-        // SAFETY: `dir` is a live directory descriptor for the parent, and
-        // `name` is a NUL-terminated single path component that outlives the
-        // call.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(Error::last_os_error());
-        }
-        // SAFETY: `openat` returned a fresh owned descriptor. Assigning it
-        // drops the previous one, closing the parent we no longer need.
-        dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    }
-    Ok(std::fs::File::from(dir))
-}
-
-/// As above. Windows has no `openat`, so containment is established after the
-/// fact instead of during resolution: the file is opened without following a
-/// final reparse point, and the *handle* is then asked where it actually ended
-/// up. Anything that is not under the root's own resolved path is refused.
-///
-/// This is race-free in the way that matters. Checking each ancestor by path
-/// first would only reject a junction that happened to be there at the time of
-/// the check — one substituted between the check and the open would still be
-/// followed. Asking the handle removes the second lookup entirely: whatever the
-/// open resolved through, the answer describes the object we are actually
-/// holding.
-#[cfg(windows)]
-fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
-    use std::io::{Error, ErrorKind};
-
-    // Rejects escapes and non-literal components before anything is opened.
-    relative_components(root, path)?;
-    let file = open_no_follow(path)?;
-
-    // The root's own resolved path, since it may itself sit under a junction or
-    // a substituted drive — comparing against the path as given would then
-    // reject every file in the tree. `canonicalize` is the same
-    // `GetFinalPathNameByHandleW` query underneath, so the two agree on
-    // verbatim prefix and casing.
-    let anchor = std::fs::canonicalize(root)?;
-    let opened = final_path_of(&file)?;
-    if !opened.starts_with(&anchor) {
-        return Err(Error::new(
-            ErrorKind::InvalidInput,
-            "path resolves outside the served root",
-        ));
-    }
-    Ok(file)
-}
-
-/// Where an open handle actually is, with every reparse point on the way
-/// resolved.
-#[cfg(windows)]
-fn final_path_of(file: &std::fs::File) -> std::io::Result<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
-    };
-
-    let handle = file.as_raw_handle() as isize;
-    let mut buf = vec![0u16; 512];
-    loop {
-        // SAFETY: `handle` is a live file handle borrowed from `file`, and the
-        // buffer's length is passed as its capacity in `u16`s.
-        let needed = unsafe {
-            GetFinalPathNameByHandleW(
-                handle as _,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
-            )
-        };
-        if needed == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // The return value excludes the NUL when it fits and includes it when
-        // it does not, so a value at or past the capacity means "too small".
-        if (needed as usize) < buf.len() {
-            buf.truncate(needed as usize);
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
-        }
-        buf.resize(needed as usize + 1, 0);
-    }
-}
-
-/// A fallback for platforms that are neither unix nor Windows, where there is
-/// no way to do better than refusing a link that is actually there.
-#[cfg(not(any(unix, windows)))]
-fn open_within_root(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
-    use std::io::{Error, ErrorKind};
-
-    let components = relative_components(root, path)?;
-    let mut walked = root.to_path_buf();
-    for component in &components[..components.len() - 1] {
-        walked.push(component);
-        let meta = std::fs::symlink_metadata(&walked)?;
-        if meta.file_type().is_symlink() {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "path traverses a symlink",
-            ));
-        }
-        if !meta.is_dir() {
-            return Err(Error::new(ErrorKind::NotADirectory, "not a directory"));
-        }
-    }
-    open_no_follow(path)
-}
-
-/// `path` split into the literal components below `root`.
-///
-/// Anything that is not a plain name — `..`, a root, a prefix — is refused
-/// rather than interpreted, since resolving those is the whole business
-/// [`open_within_root`] is avoiding.
-fn relative_components(root: &Path, path: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
-    use std::io::{Error, ErrorKind};
-
-    let rel = path
-        .strip_prefix(root)
+    let relative = path
+        .strip_prefix(&state.root)
         .map_err(|_| Error::new(ErrorKind::InvalidInput, "path is outside the served root"))?;
-    let mut components = Vec::new();
-    for component in rel.components() {
-        match component {
-            std::path::Component::Normal(name) => components.push(name.to_os_string()),
-            _ => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    "path has a non-literal component",
-                ));
-            }
-        }
-    }
-    if components.is_empty() {
-        return Err(Error::new(ErrorKind::InvalidInput, "path is the root"));
-    }
-    Ok(components)
+    state.rooted.open_file(relative)
 }
+
+#[cfg(all(test, windows))]
+use tgrep_core::rooted::final_path_of;
 
 /// The outcome of reading a file whose stat'd size has already been approved.
 enum CappedRead {
@@ -5197,14 +5011,14 @@ enum CappedRead {
 }
 
 fn file_still_has_bytes(
-    root: &Path,
+    state: &ServerState,
     path: &Path,
     expected_version: &tgrep_core::builder::FileVersion,
     expected: &[u8],
 ) -> std::io::Result<bool> {
     use std::io::Read;
 
-    let mut file = open_within_root(root, path)?;
+    let mut file = open_within_root(state, path)?;
     if tgrep_core::builder::file_version(&file.metadata()?) != *expected_version {
         return Ok(false);
     }
@@ -5225,12 +5039,12 @@ fn file_still_has_bytes(
     {
         return Ok(false);
     }
-    let current = open_within_root(root, path)?;
+    let current = open_within_root(state, path)?;
     Ok(tgrep_core::builder::file_version(&current.metadata()?) == *expected_version)
 }
 
 fn current_path_is_ineligible(state: &ServerState, path: &Path) -> bool {
-    let file = match open_within_root(&state.root, path) {
+    let file = match open_within_root(state, path) {
         Ok(file) => file,
         Err(error) => return proves_ineligible(&error),
     };
@@ -5306,7 +5120,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     // type, size, mtime, bytes — read back off it. Nothing that happens to the
     // path in the meantime can then make the content we index disagree with the
     // metadata we judged it by, or put it outside the tree we serve.
-    let file = match open_within_root(&state.root, path) {
+    let file = match open_within_root(state, path) {
         Ok(f) => f,
         Err(e) if proves_ineligible(&e) => {
             // Gone, or not a regular file reachable without traversing a link.
@@ -5385,7 +5199,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
         drop(file);
         let mut stable = None;
         for _ in 0..2 {
-            let mut verify = match open_within_root(&state.root, path) {
+            let mut verify = match open_within_root(state, path) {
                 Ok(file) => file,
                 Err(e) if proves_ineligible(&e) => {
                     drop_indexed_file(state, rel_path, "no longer eligible");
@@ -5467,7 +5281,7 @@ fn reindex_file(state: &Arc<ServerState>, path: &Path, rel_path: &str, force: bo
     };
     #[cfg(test)]
     run_stale_refresh_hook(state, StaleRefreshPhase::BeforeConcreteCommit);
-    match file_still_has_bytes(&state.root, path, &version, &data) {
+    match file_still_has_bytes(state, path, &version, &data) {
         Ok(true) => {}
         Ok(false) => {
             if current_path_is_ineligible(state, path) {
@@ -7380,7 +7194,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                 .par_iter()
                 .filter_map(|path| {
                     let read = (|| -> Result<_> {
-                        let mut file = open_within_root(root, path)?;
+                        let mut file = open_within_root(state, path)?;
                         let version = builder::file_version(&file.metadata()?);
                         let data = match read_within_limit(
                             &mut file,
@@ -7393,7 +7207,7 @@ fn background_index_build(state: &Arc<ServerState>, root: &Path, index_dir: &Pat
                             }
                             CappedRead::Failed => anyhow::bail!("file read failed"),
                         };
-                        if !file_still_has_bytes(root, path, &version, &data)? {
+                        if !file_still_has_bytes(state, path, &version, &data)? {
                             anyhow::bail!("file changed during indexing");
                         }
                         Ok((data, version))
@@ -8981,7 +8795,9 @@ mod tests {
     #[test]
     fn failed_polling_startup_hands_retries_to_the_configured_cadence() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("missing");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(".ignore"), "[z-a]\n").unwrap();
         let index_dir = tmp.path().join("index");
         let mut state = test_server_state(&root, &index_dir);
         Arc::get_mut(&mut state).unwrap().refresh =
@@ -9062,6 +8878,7 @@ mod tests {
                 RECENT_REINDEX_MAX_ENTRY_BYTES,
             )),
             root: root.to_path_buf(),
+            rooted: tgrep_core::rooted::RootedDir::open(root).expect("pin served root"),
             watcher_active: std::sync::atomic::AtomicBool::new(false),
             indexing: std::sync::atomic::AtomicBool::new(false),
             flushing: std::sync::atomic::AtomicBool::new(false),
@@ -12368,8 +12185,36 @@ mod tests {
         );
     }
 
-    /// The metadata the eligibility check uses and the bytes that get indexed
-    /// have to describe the same object, which means one handle.
+    #[test]
+    fn serving_retains_root_identity_between_file_reads() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"inside").unwrap();
+        let state = test_server_state(&root, &temp.path().join("index"));
+        for _ in 0..3 {
+            let file = open_within_root(&state, &root.join("file.txt")).unwrap();
+            assert_eq!(file.metadata().unwrap().len(), 6);
+        }
+        let renamed = std::fs::rename(&root, temp.path().join("saved"));
+        #[cfg(unix)]
+        {
+            renamed.unwrap();
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("file.txt"), b"outside").unwrap();
+            assert!(
+                open_within_root(&state, &root.join("file.txt")).is_err(),
+                "successive opens must retain the original root identity"
+            );
+        }
+        #[cfg(windows)]
+        assert!(
+            renamed.is_err(),
+            "the server must retain its root guard between opens"
+        );
+    }
+
+    /// The metadata and bytes must describe the same opened object.
     #[test]
     fn open_within_root_reads_a_regular_file() {
         use std::io::Read;
@@ -12379,7 +12224,8 @@ mod tests {
         let path = tmp.path().join("src").join("plain.rs");
         std::fs::write(&path, "fn main() {}\n").unwrap();
 
-        let file = open_within_root(tmp.path(), &path).expect("a regular file opens");
+        let state = test_server_state(tmp.path(), &tmp.path().join(".tgrep"));
+        let file = open_within_root(&state, &path).expect("a regular file opens");
         let meta = file.metadata().expect("metadata off the handle");
         assert!(meta.is_file());
         assert_eq!(meta.len(), 13);
@@ -12401,9 +12247,10 @@ mod tests {
         let root = TempDir::new().unwrap();
         let link = root.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
+        let state = test_server_state(root.path(), &root.path().join(".tgrep"));
 
         assert!(
-            open_within_root(root.path(), &link).is_err(),
+            open_within_root(&state, &link).is_err(),
             "the link must not open as its target"
         );
     }
@@ -12421,12 +12268,13 @@ mod tests {
         let link = root.path().join("a");
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         let through_link = link.join("secret.txt");
+        let state = test_server_state(root.path(), &root.path().join(".tgrep"));
 
         // The file at the end of that path is a perfectly ordinary file, and
         // opening it by name works — which is the point.
         assert!(std::fs::File::open(&through_link).is_ok());
         assert!(
-            open_within_root(root.path(), &through_link).is_err(),
+            open_within_root(&state, &through_link).is_err(),
             "an intermediate symlink must not be traversed"
         );
     }
@@ -12579,18 +12427,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir(tmp.path().join("src")).unwrap();
         std::fs::write(tmp.path().join("src").join("a.rs"), "x\n").unwrap();
+        let state = test_server_state(tmp.path(), &tmp.path().join(".tgrep"));
 
+        assert!(open_within_root(&state, tmp.path()).is_err(), "the root");
         assert!(
-            open_within_root(tmp.path(), tmp.path()).is_err(),
-            "the root"
-        );
-        assert!(
-            open_within_root(tmp.path(), &tmp.path().join("..").join("a.rs")).is_err(),
+            open_within_root(&state, &tmp.path().join("..").join("a.rs")).is_err(),
             "a parent component"
         );
         assert!(
-            open_within_root(&tmp.path().join("src"), &tmp.path().join("src")).is_err(),
-            "outside the given root"
+            open_within_root(&state, &tmp.path().join("src")).is_err(),
+            "a directory, not a regular file"
         );
     }
 

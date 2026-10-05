@@ -2,7 +2,8 @@
 
 **Status:** end-state architecture with the shared-reader and overlay-checkpoint
 foundation implemented in [PR #168](https://github.com/microsoft/tgrep/pull/168),
-and [committed-tree base generations](tgrep-core/src/generations/mod.rs) implemented.
+with [committed-tree base generations](tgrep-core/src/generations/mod.rs) and
+[core worktree synchronization](tgrep-core/src/worktrees.rs) implemented.
 Automatic multi-worktree CLI/server support is not implemented yet.
 
 ## Goal and ownership
@@ -303,8 +304,8 @@ Oversized, binary, symlink and gitlink records remain distinguishable in tracked
 membership; symlinks and gitlinks are not followed or content-indexed.
 
 Clean Git status and equal blob IDs do not prove equivalence of worktree bytes.
-Layer 2 must prove compatible decoded identities from stable reads, or overlay
-transformed/changed files or scan. It must also apply worktree-specific membership,
+The synchronization layer verifies decoded identities from checkout reads, or
+overlays transformed/changed files. It also applies worktree-specific membership,
 including ignored/extension-filtered files, sparse checkout and filesystem case
 behavior. Non-UTF-8 tracked names, unsafe relative paths, and paths unrepresentable
 on the current platform are explicit unsupported errors, not lossy aliases.
@@ -341,11 +342,145 @@ Atomic visibility is not a parent-directory power-loss durability guarantee.
 These checks detect inconsistent/corrupt data; storage must still be trusted,
 not treated as an authenticated format for adversarially rewritten files.
 
-For layer 2, retain the generation pin with each view and serialize its key
-alongside overlay checkpoints. The generation's `SharedBase` fingerprint still
+The synchronization layer retains the generation pin with each view and serializes
+its key inside the delta checkpoint. The generation's `SharedBase` fingerprint still
 binds the checkpoint to exact index bytes. Reopening that key is not readiness:
-reconcile the worktree before enabling indexed queries. No watcher, Git delta
-discovery, daemon wire schema or CLI shared-mode behavior is introduced here.
+reconcile the worktree before enabling indexed queries.
+
+## Implemented worktree synchronization API
+
+`tgrep_core::worktrees::WorktreeView::new(root, pin, options)` validates that the
+canonical root is an actual worktree root in the pinned repository. Independent
+clones, bare repositories and subdirectory roots are rejected. The exact
+`Arc<Generation>`, canonical root and worktree Git directory stay with the view;
+no mutable base/flush handle is exposed and no base migration occurs.
+
+| API | Contract |
+| --- | --- |
+| `WorktreeOptions` | Existing `MetaWalkOptions`, bounded `hint_capacity`, optional existing private `checkpoint_directory` |
+| `invalidate_path(relative)` | Close query gate; queue a file/subtree hint, including old/new rename paths; invalid input errors and forces full repair |
+| `invalidate_all()` | Close gate and require full verification for startup, overflow, Git/config changes, missed events or polling uncertainty |
+| `refresh()` | Rewalk membership/visibility; verify hints/new/stat-changed files or, without hints, all admitted contents |
+| `reconcile_full()` | Always read/verify content, irrespective of size/mtime/Git-status equality |
+| `status()` | Ready flag, invalidation epoch, published epoch, pending-path count and full-required flag |
+| `with_snapshot(closure)` | Guarded query-only view with root/epoch/visibility, resolved paths and read-only candidate opens; verifies pinned-root identity before/after the callback |
+| `save_checkpoint()` | Ready-only, delta-only atomic `overlay.json`, including exact generation key/root/base binding |
+| `restore(root, pin, options)` | Explicit errors for missing/invalid/mismatched checkpoints; successful restore remains not ready |
+| `ReconcileStats` | Actual content reads/bytes/decodes/extractions, base/overlay reuse, copied base files/postings, reads avoided and `hint_lookups` ordered-set probes |
+
+The agent runtime subscribes **after construction and before initial refresh**,
+then forwards native/polling/no-watch inputs through these same invalidations.
+Each refresh makes one bounded attempt, serialized per view. Files are prepared
+outside the readiness lock; invalidations can continue to arrive. Overlay,
+visibility and filename membership publish together only if the captured epoch
+still matches. Otherwise `ChangedDuringReconcile` leaves the view not ready with
+full work pending. Retrying replays by full verification; sustained churn must
+scan or wait, never spin indefinitely. Incomplete metadata walks (including
+ignore-rule errors), unreadable tracked exemptions, failed reads and detected
+read instability also keep the gate closed. No base-only success is possible.
+Native directory/file names are validated before converting metadata-walk paths
+or recording visibility. Non-Unicode names and literal Unix backslashes produce
+discovery errors instead of aliasing valid or ignored paths; ordinary native-path
+full scans remain the fallback.
+Reconciliation holds a stable root directory handle. The extracted
+`tgrep_core::rooted::RootedDir` helper (`open`, relative `open_file`, `verify_root`)
+is also retained once per ordinary server and reused across indexing, watcher
+and verification passes, rather than reconstructed for each file open. Unix descends with component-relative
+`openat`, `O_NOFOLLOW` and `O_NONBLOCK`, then verifies the final handle is regular.
+Windows holds ancestor handles without delete sharing, rejects reparse
+points and validates the final handle's containment and actual parent before
+reading. File version and identity are rechecked through rooted handles; a root identity change also
+prevents publication. Errors leave readiness closed, including directory/link
+swaps and regular-file/FIFO swaps. Windows keeps the root guard until view drop;
+agent runtimes must release registrations before removing or renaming worktrees.
+Ordinary serving retains its root guard for the server lifetime too: stop the
+ordinary server before removing or renaming its served root on Windows.
+Each reconciliation advances the epoch, including no-hint full repairs, so
+successful publication acknowledges earlier invalidation tokens with an equal
+or later epoch.
+
+`WorktreeSnapshot::candidates(plan, prefix, include_hidden)` resolves both base
+and live IDs before releasing the overlay guard. `files(prefix, include_hidden)`
+comes from complete walker filename membership, not posting lists.
+`open_file(relative)` returns a read-only regular-file handle from the view's
+retained reader, never from a new registration of the root pathname.
+`with_snapshot` checks pinned-root identity before and after every callback,
+including empty/file-only queries; failure invalidates readiness and queues full
+reconciliation. Candidate-open failures are latched and returned as an outer
+I/O error, with readiness invalidated before releasing the guard even if the
+callback swallowed the error or subsequently opened another file successfully.
+A callback may return the owned handle for bounded matching
+outside the guard; reenter `with_snapshot` and verify the original epoch before
+publishing buffered results. File contents are not frozen by these handles.
+Later handle-read errors remain caller-owned: report them and call
+`invalidate_all()` after leaving the guard, without publishing partial results.
+Hidden files
+are included in canonical coverage and filtered at query time, including Windows
+attributes and explicit hidden-directory scopes. Existing walker rules determine
+ignore/extension, materialized symlink/submodule and regular-file behavior.
+Missing, sparse and ineligible base paths are tombstoned; staged, unstaged,
+committed-divergent and eligible untracked files use whole-file overlays. Restoring
+the pinned content removes the override; committing divergent content does not.
+
+Full passes walk without a metadata-only size cutoff, then bound actual reads to
+the configured limit plus one byte and classify the bytes read. Eligible content
+is auto-decoded and hashed before reuse, so CRLF, smudge, encoding, assume-unchanged
+and skip-worktree cases cannot rely on clean status or index stat data. Verified
+content-identical copies/renames can populate new overlay paths by copying base
+masks in one streaming posting pass. Matching existing overlays keep their masks.
+
+This saves trigram extraction, **not all repository-sized startup work**. Every
+refresh walks metadata and membership. Full passes read/verify all admitted
+content; hinted passes can retain previous evidence for unaffected paths under
+the explicit event-driven freshness contract. Case-alias hints conservatively
+reverify; non-ASCII hints and capacity overflow require full verification.
+Accepted hints are rebuilt from normal path components, so trailing/repeated
+separators and interior `.` spellings cannot lose subtree invalidations. Absolute,
+parent-component and leading `.` component hints still error and require full repair.
+Hint matching probes a `BTreeSet` for the normalized full path and ancestor
+prefixes, rather than scanning every hint for every file. `hint_lookups` counts
+these probes (at most path depth per file, each logarithmic in queue size);
+the regression uses 2,001 pending hints but only five probes for two files.
+Hinted passes still open eligible regular-file handles for safe metadata
+verification even when content reads are avoided.
+Same-size/restored-mtime edits without notifications are repaired by forced
+full checks, not promised by hints. Successful refresh acknowledges processed
+inputs, not an atomic filesystem snapshot. Final matching uses
+`WorktreeSnapshot::open_file` or a private versioned cache, not an ordinary read
+of `snapshot.root().join(path)` that could follow a raced link outside the
+worktree. Contents can still change through later writes to the opened file.
+
+Raw LF blobs and clean CRLF/smudge checkouts may differ for **every file**.
+Normalizing line endings would invalidate positional/next-byte masks. Fixtures
+assert three identical tracked files are read/decoded with zero extractions,
+versus four clean transformed tracked files requiring four private extractions.
+The linked worktree's plain `.git` pointer file adds one private extraction
+in either case; later unchanged passes reuse all private overlays.
+No transformed-content cross-view cache is
+implemented. Preparation retains O(paths) metadata plus changed-file masks
+until publication, in addition to the existing private overlay. A large
+transformed checkout can therefore require substantial private memory.
+
+Checkpoints use the foundation's single directory-bound atomic publication;
+there are no unprotected auxiliary manifest writes. A configured private
+checkpoint path must be an existing directory; construction, restoration and
+saving reject regular-file paths instead of accepting an unusable view.
+The checkpoint directory is excluded in its entirety (including staging files),
+along with `.tgrep`, Git metadata directories, generation storage and caller-supplied
+`walk.exclude_paths`. It cannot be an index snapshot, Git metadata or a worktree
+ancestor. Storage must remain trusted and not externally renamed while in use.
+The plain `.git` pointer in a linked worktree follows ordinary walker membership:
+its filename and content are available with hidden inclusion, subject to ignore
+and size rules. The named Git metadata directories remain excluded; the file's
+contents are not followed as a filesystem link.
+Restoration validates the exact generation key, base bytes and canonical root but
+does not restore readiness or trusted read evidence; first reconciliation may
+re-extract restored private postings. Missing/stale/invalid state is an explicit
+recoverable error, not an empty overlay. Bases remain immutable and retain-all.
+
+This core layer does **not** own native watchers, automatic shared CLI serving,
+daemon routing/wire schemas or content caches. Existing CLI/server behavior is
+unchanged; opt-in integration is the next layer.
 
 ## Implementation status and rollout
 
@@ -361,7 +496,9 @@ The implemented increments are core-library APIs, not automatic shared indexing:
 | [`Regression coverage`](tgrep-core/tests/shared_worktrees.rs) | Sharing/isolation, masks, tombstones, restoration, compatibility, repeated saves, and Windows failure recovery |
 | [`Generation management`](tgrep-core/src/generations/mod.rs) | Canonical common-dir identity, raw committed-tree builds, incremental posting reuse, cross-process deduplication, pins and retain-all |
 | [`Generation coverage`](tgrep-core/tests/generations.rs) | Temporary repositories/worktrees, thread/process races, content transformations, immutable old readers, errors and interrupted publication |
-| Worktree synchronization and daemon routing | Follow-up work; not yet implemented |
+| [`Worktree synchronization`](tgrep-core/src/worktrees.rs) | Pinned private views, actual-content verification, atomic readiness/membership, bounded invalidations, full repair and bound checkpoints |
+| [`Synchronization coverage`](tgrep-core/src/worktrees/tests.rs) | Real divergent worktrees, scan/candidate parity, CRLF/smudge/decoding, sparse/assume-unchanged, filtering, epochs, errors and extraction counts |
+| Shared CLI/daemon routing and native watchers | Follow-up work; not yet implemented |
 
 Shared-base validation rejects mismatched empty lookup/posting sections and
 metadata counts inconsistent with the opened sections, while allowing empty
