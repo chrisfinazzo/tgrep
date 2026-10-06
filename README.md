@@ -48,6 +48,17 @@ client/server search latency with the index already built, not indexing time.
 Results depend on the query, repository, storage, and match volume. See
 [BENCHMARKS.md](BENCHMARKS.md) for measurements and methodology.
 
+### Shared-worktree benchmark
+
+The [shared-worktree baseline](SHARED_INDEX_BENCHMARKS.md) compares one ordinary
+server/index per worktree with one shared daemon across 1, 4, 16 and 32 synthetic
+Git worktrees. It covers LF, clean CRLF, private branch changes and bounded churn,
+with scan-checked results, fresh/restart startup, query percentiles, reconciliation
+counters, process resources and retained storage. It includes a small Windows/Linux
+smoke command and distinguishes logical sharing from OS page-cache and RSS effects.
+The measured baseline saves LF memory/storage but has higher startup/query latency;
+clean CRLF can cost more memory/storage too. Shared mode remains opt-in.
+
 ## Usage
 
 ### Build the index
