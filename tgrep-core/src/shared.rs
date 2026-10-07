@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -261,7 +261,7 @@ impl CheckpointDestination {
         let mut guards = Vec::new();
         for component in directory.components() {
             current.push(component);
-            if matches!(component, Component::Prefix(_)) {
+            if matches!(component, std::path::Component::Prefix(_)) {
                 continue;
             }
             // Windows replacement uses paths. Deny renames/deletion of every
@@ -519,17 +519,7 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn validate_path(path: &str) -> Result<()> {
-    if path.contains(['\\', '\0'])
-        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
-        || Path::new(path)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(invalid(
-            "index path must be a normalized worktree-relative path",
-        ));
-    }
-    Ok(())
+    crate::rooted::validate_index_path(path).map_err(|error| invalid(&error.to_string()))
 }
 
 fn validate_trigram(trigram: u32, loc_mask: u8) -> Result<()> {
